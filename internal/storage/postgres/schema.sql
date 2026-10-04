@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS conversation_participants (
     user_id VARCHAR(64) NOT NULL,
     last_read_seq_id BIGINT NOT NULL DEFAULT 0,
     last_delivered_seq_id BIGINT NOT NULL DEFAULT 0,
+    cleared_seq_id BIGINT NOT NULL DEFAULT 0,
     joined_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     PRIMARY KEY (conversation_id, user_id)
 );

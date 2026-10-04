@@ -108,3 +108,58 @@ func (c *Client) PublishEnvelope(ctx context.Context, channel string, env *model
 func (c *Client) Subscribe(ctx context.Context, channel string) *redis.PubSub {
 	return c.rdb.Subscribe(ctx, channel)
 }
+
+// IsTokenBlacklisted checks if an access token JTI is in the Redis blacklist
+func (c *Client) IsTokenBlacklisted(ctx context.Context, tokenID string) (bool, error) {
+	if tokenID == "" {
+		return false, nil
+	}
+	key := fmt.Sprintf("blacklist:token:%s", tokenID)
+	val, err := c.rdb.Exists(ctx, key).Result()
+	if err != nil {
+		return false, err
+	}
+	return val > 0, nil
+}
+
+// IsUserBlacklisted checks if user sessions before issuedAt were revoked
+func (c *Client) IsUserBlacklisted(ctx context.Context, userID string, issuedAt time.Time) (bool, error) {
+	if userID == "" {
+		return false, nil
+	}
+	key := fmt.Sprintf("blacklist:user:%s", userID)
+	val, err := c.rdb.Get(ctx, key).Int64()
+	if err == redis.Nil {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	// If token was issued before or at the revocation timestamp, it is invalid
+	return issuedAt.Unix() <= val, nil
+}
+
+// CreateWSTicket stores a short-lived single-use ticket for WebSocket handshake
+func (c *Client) CreateWSTicket(ctx context.Context, ticket string, userData []byte, ttl time.Duration) error {
+	key := fmt.Sprintf("ws_ticket:%s", ticket)
+	return c.rdb.Set(ctx, key, userData, ttl).Err()
+}
+
+// ConsumeWSTicket atomically retrieves and deletes a WebSocket handshake ticket
+func (c *Client) ConsumeWSTicket(ctx context.Context, ticket string) ([]byte, error) {
+	key := fmt.Sprintf("ws_ticket:%s", ticket)
+	pipe := c.rdb.TxPipeline()
+	getCmd := pipe.Get(ctx, key)
+	pipe.Del(ctx, key)
+	if _, err := pipe.Exec(ctx); err != nil {
+		if err == redis.Nil {
+			return nil, nil
+		}
+		return nil, err
+	}
+	data, err := getCmd.Bytes()
+	if err == redis.Nil {
+		return nil, nil
+	}
+	return data, err
+}

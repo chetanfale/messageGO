@@ -50,6 +50,8 @@ func (d *DB) InitSchema(schemaSQL string) error {
 	if err != nil {
 		return fmt.Errorf("failed to execute schema initialization: %w", err)
 	}
+	// Ensure cleared_seq_id column exists for zero-downtime upgrades
+	_, _ = d.pool.ExecContext(ctx, `ALTER TABLE conversation_participants ADD COLUMN IF NOT EXISTS cleared_seq_id BIGINT NOT NULL DEFAULT 0;`)
 	log.Println("[POSTGRES] Schema initialized successfully")
 	return nil
 }
@@ -173,6 +175,50 @@ func (d *DB) GetMessagesSince(ctx context.Context, convID string, sinceSeqID int
 	return messages, nil
 }
 
+// GetConversationMessages fetches messages respecting the requesting user's cleared_seq_id
+func (d *DB) GetConversationMessages(ctx context.Context, convID, userID string, sinceSeqID int64, limit int) ([]*models.Message, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+
+	query := `
+		SELECT m.id, m.conversation_id, m.seq_id, m.sender_id, m.client_msg_id, m.content_type, m.content, m.created_at
+		FROM messages m
+		JOIN conversation_participants cp ON cp.conversation_id = m.conversation_id
+		WHERE m.conversation_id = $1 
+		  AND cp.user_id = $2
+		  AND m.seq_id > GREATEST($3, cp.cleared_seq_id)
+		ORDER BY m.seq_id ASC
+		LIMIT $4;
+	`
+
+	rows, err := d.pool.QueryContext(ctx, query, convID, userID, sinceSeqID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch conversation messages: %w", err)
+	}
+	defer rows.Close()
+
+	messages := make([]*models.Message, 0)
+	for rows.Next() {
+		var m models.Message
+		if err := rows.Scan(
+			&m.ID,
+			&m.ConversationID,
+			&m.SeqID,
+			&m.SenderID,
+			&m.ClientMsgID,
+			&m.ContentType,
+			&m.Content,
+			&m.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		messages = append(messages, &m)
+	}
+
+	return messages, nil
+}
+
 // UpdateReadCursor updates the watermark read cursor for a user in a conversation
 func (d *DB) UpdateReadCursor(ctx context.Context, convID, userID string, seqID int64) error {
 	query := `
@@ -193,6 +239,25 @@ func (d *DB) UpdateDeliveryCursor(ctx context.Context, convID, userID string, se
 	`
 	_, err := d.pool.ExecContext(ctx, query, convID, userID, seqID)
 	return err
+}
+
+// ClearConversation sets cleared_seq_id to last_seq_id for the user in this conversation (per-user soft clear)
+func (d *DB) ClearConversation(ctx context.Context, convID, userID string) error {
+	query := `
+		UPDATE conversation_participants cp
+		SET cleared_seq_id = c.last_seq_id
+		FROM conversations c
+		WHERE cp.conversation_id = $1 AND cp.user_id = $2 AND c.id = cp.conversation_id;
+	`
+	res, err := d.pool.ExecContext(ctx, query, convID, userID)
+	if err != nil {
+		return err
+	}
+	rows, _ := res.RowsAffected()
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // GetConversationParticipants returns all user IDs in a conversation
@@ -222,7 +287,7 @@ func (d *DB) GetUndeliveredMessages(ctx context.Context, userID string) ([]*mode
 		FROM messages m
 		JOIN conversation_participants cp ON cp.conversation_id = m.conversation_id
 		WHERE cp.user_id = $1 
-		  AND m.seq_id > cp.last_delivered_seq_id 
+		  AND m.seq_id > GREATEST(cp.last_delivered_seq_id, cp.cleared_seq_id)
 		  AND m.sender_id != $1
 		ORDER BY m.seq_id ASC;
 	`
@@ -264,7 +329,7 @@ func (d *DB) GetUserConversationHistory(ctx context.Context, userID string, limi
 		SELECT m.id, m.conversation_id, m.seq_id, m.sender_id, m.client_msg_id, m.content_type, m.content, m.created_at
 		FROM messages m
 		JOIN conversation_participants cp ON cp.conversation_id = m.conversation_id
-		WHERE cp.user_id = $1
+		WHERE cp.user_id = $1 AND m.seq_id > cp.cleared_seq_id
 		ORDER BY m.created_at ASC, m.seq_id ASC
 		LIMIT $2;
 	`
@@ -294,4 +359,93 @@ func (d *DB) GetUserConversationHistory(ctx context.Context, userID string, limi
 	}
 
 	return messages, nil
+}
+
+// GetUserConversations retrieves all conversations for a user with unread counts & last message preview
+func (d *DB) GetUserConversations(ctx context.Context, userID string) ([]*models.ConversationSummary, error) {
+	query := `
+		SELECT 
+			c.id, 
+			c.type, 
+			COALESCE(c.title, ''), 
+			c.last_seq_id, 
+			cp.last_read_seq_id, 
+			c.updated_at,
+			COALESCE((
+				SELECT cp2.user_id 
+				FROM conversation_participants cp2 
+				WHERE cp2.conversation_id = c.id AND cp2.user_id != $1 
+				LIMIT 1
+			), '') AS peer_id,
+			(
+				SELECT COUNT(*) 
+				FROM messages m 
+				WHERE m.conversation_id = c.id 
+				  AND m.seq_id > cp.last_read_seq_id 
+				  AND m.seq_id > cp.cleared_seq_id 
+				  AND m.sender_id != $1
+			) AS unread_count
+		FROM conversations c
+		JOIN conversation_participants cp ON cp.conversation_id = c.id
+		WHERE cp.user_id = $1
+		ORDER BY c.updated_at DESC;
+	`
+
+	rows, err := d.pool.QueryContext(ctx, query, userID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query conversations: %w", err)
+	}
+	defer rows.Close()
+
+	summaries := make([]*models.ConversationSummary, 0)
+	for rows.Next() {
+		var s models.ConversationSummary
+		if err := rows.Scan(
+			&s.ID,
+			&s.Type,
+			&s.Title,
+			&s.LastSeqID,
+			&s.LastReadSeqID,
+			&s.UpdatedAt,
+			&s.RecipientID,
+			&s.UnreadCount,
+		); err != nil {
+			return nil, err
+		}
+
+		// Fetch last message respecting cleared_seq_id
+		lastMsgQuery := `
+			SELECT m.id, m.conversation_id, m.seq_id, m.sender_id, m.client_msg_id, m.content_type, m.content, m.created_at
+			FROM messages m
+			JOIN conversation_participants cp ON cp.conversation_id = m.conversation_id
+			WHERE m.conversation_id = $1 AND cp.user_id = $2 AND m.seq_id > cp.cleared_seq_id
+			ORDER BY m.seq_id DESC
+			LIMIT 1;
+		`
+		var msg models.Message
+		err := d.pool.QueryRowContext(ctx, lastMsgQuery, s.ID, userID).Scan(
+			&msg.ID, &msg.ConversationID, &msg.SeqID, &msg.SenderID, &msg.ClientMsgID, &msg.ContentType, &msg.Content, &msg.CreatedAt,
+		)
+		if err == nil {
+			s.LastMessage = &msg
+		}
+
+		summaries = append(summaries, &s)
+	}
+
+	return summaries, nil
+}
+
+// DeleteConversation leaves or deletes a conversation for the user
+func (d *DB) DeleteConversation(ctx context.Context, convID, userID string) error {
+	query := `DELETE FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2;`
+	_, err := d.pool.ExecContext(ctx, query, convID, userID)
+	if err != nil {
+		return err
+	}
+
+	// Delete orphan conversation if no participants left
+	orphanQuery := `DELETE FROM conversations WHERE id = $1 AND NOT EXISTS (SELECT 1 FROM conversation_participants WHERE conversation_id = $1);`
+	_, _ = d.pool.ExecContext(ctx, orphanQuery, convID)
+	return nil
 }

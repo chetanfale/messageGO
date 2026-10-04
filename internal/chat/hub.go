@@ -197,6 +197,17 @@ func (h *Hub) handleChatMessage(ctx context.Context, sender *Client, data json.R
 		}
 	}
 
+	// Validation 3: Prevent empty or whitespace-only messages
+	cleanContent := strings.TrimSpace(inbound.Content)
+	if cleanContent == "" {
+		sender.sendError("EMPTY_MESSAGE", "Message content cannot be empty or whitespace only")
+		return
+	}
+	if len(cleanContent) > 10000 {
+		sender.sendError("MESSAGE_TOO_LARGE", "Message content exceeds limit of 10000 characters")
+		return
+	}
+
 	clientMsgID := strings.TrimSpace(inbound.ClientMsgID)
 	if clientMsgID == "" {
 		clientMsgID = uuid.New().String()
@@ -208,7 +219,7 @@ func (h *Hub) handleChatMessage(ctx context.Context, sender *Client, data json.R
 	}
 
 	// 1. Atomic sequence assignment and database insertion
-	msg, err := h.db.SaveMessageAtomic(ctx, convID, sender.UserID, clientMsgID, contentType, inbound.Content)
+	msg, err := h.db.SaveMessageAtomic(ctx, convID, sender.UserID, clientMsgID, contentType, cleanContent)
 	if err != nil {
 		log.Printf("[HUB] Failed to save message atomically: %v", err)
 		sender.sendError("PERSIST_ERROR", "Failed to persist message")
@@ -217,33 +228,49 @@ func (h *Hub) handleChatMessage(ctx context.Context, sender *Client, data json.R
 
 	log.Printf("[HUB] Message saved [conv=%s, seq=%d, sender=%s (%s)]", convID, msg.SeqID, sender.UserID, sender.Username)
 
-	// 2. Deliver Server ACK immediately back to sender
-	serverAckData, _ := json.Marshal(models.ServerACK{
-		ClientMsgID:    clientMsgID,
-		MessageID:      msg.ID,
-		ConversationID: convID,
-		SeqID:          msg.SeqID,
-		Timestamp:      msg.CreatedAt,
-	})
-	h.sendToUser(sender.UserID, &models.Envelope{Type: "server_ack", Data: serverAckData})
-
-	// 3. Resolve conversation participants and route envelope
+	// 2. Resolve conversation participants and route envelope
 	participants, err := h.db.GetConversationParticipants(ctx, convID)
 	if err != nil {
 		log.Printf("[HUB] Error fetching participants for %s: %v", convID, err)
+		sender.sendError("ROUTING_ERROR", "Failed to resolve conversation participants")
 		return
 	}
 
 	msgData, _ := json.Marshal(msg)
 	outboundEnv := &models.Envelope{Type: "chat", Data: msgData}
+	anyDelivered := false
+	recipientOnline := false
+
 	for _, participantID := range participants {
 		if participantID == sender.UserID {
-			continue // Sender already received server_ack
+			continue // Do not route chat payload to sender
+		}
+		// Check presence
+		online, _ := h.redis.IsOnline(ctx, participantID)
+		if online {
+			recipientOnline = true
 		}
 		if h.sendToUser(participantID, outboundEnv) {
+			anyDelivered = true
 			_ = h.db.UpdateDeliveryCursor(ctx, convID, participantID, msg.SeqID)
 		}
 	}
+
+	// 3. Deliver enhanced Server ACK back to sender with live status
+	recipStatus := "offline"
+	if recipientOnline || anyDelivered {
+		recipStatus = "online"
+	}
+	serverAckData, _ := json.Marshal(models.ServerACK{
+		ClientMsgID:     clientMsgID,
+		MessageID:       msg.ID,
+		ConversationID:  convID,
+		SeqID:           msg.SeqID,
+		Timestamp:       msg.CreatedAt,
+		RecipientStatus: recipStatus,
+		Delivered:       anyDelivered,
+	})
+	h.sendToUser(sender.UserID, &models.Envelope{Type: "server_ack", Data: serverAckData})
 }
 
 func (h *Hub) handleDeliveryACK(ctx context.Context, client *Client, data json.RawMessage) {

@@ -32,13 +32,15 @@ type Message struct {
 	CreatedAt      time.Time `json:"created_at"`
 }
 
-// ServerACK confirms the message was persisted and assigned a monotonic seq_id
+// ServerACK confirms the message was persisted, assigned a seq_id, and includes recipient reachability status
 type ServerACK struct {
-	ClientMsgID    string    `json:"client_msg_id"`
-	MessageID      int64     `json:"message_id"`
-	ConversationID string    `json:"conversation_id"`
-	SeqID          int64     `json:"seq_id"`
-	Timestamp      time.Time `json:"timestamp"`
+	ClientMsgID     string    `json:"client_msg_id"`
+	MessageID       int64     `json:"message_id"`
+	ConversationID  string    `json:"conversation_id"`
+	SeqID           int64     `json:"seq_id"`
+	Timestamp       time.Time `json:"timestamp"`
+	RecipientStatus string    `json:"recipient_status"` // "online" | "offline"
+	Delivered       bool      `json:"delivered"`        // true if sent to live recipient socket, false if queued offline
 }
 
 // DeliveryACK confirms recipient device received the message
@@ -91,4 +93,30 @@ type PresenceResponse struct {
 type ErrorPayload struct {
 	Code    string `json:"code"`
 	Message string `json:"message"`
+}
+
+// WSTicketResponse contains the short-lived single-use ticket for WebSocket authentication
+type WSTicketResponse struct {
+	Ticket    string `json:"ticket"`
+	ExpiresIn int    `json:"expires_in"` // in seconds
+}
+
+// ConversationSummary represents a conversation preview in the conversation list API
+type ConversationSummary struct {
+	ID             string    `json:"id"`
+	Type           string    `json:"type"`
+	Title          string    `json:"title,omitempty"`
+	RecipientID    string    `json:"recipient_id,omitempty"`
+	LastMessage    *Message  `json:"last_message,omitempty"`
+	UnreadCount    int64     `json:"unread_count"`
+	LastSeqID      int64     `json:"last_seq_id"`
+	LastReadSeqID  int64     `json:"last_read_seq_id"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+// CreateConversationRequest payload for creating a new conversation
+type CreateConversationRequest struct {
+	RecipientID string `json:"recipient_id"`
+	Title       string `json:"title,omitempty"`
+	Type        string `json:"type,omitempty"` // "direct" or "group"
 }

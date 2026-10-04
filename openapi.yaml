@@ -1,10 +1,10 @@
 openapi: 3.1.0
 info:
   title: MessageGO WebSocket Real-Time Chat API
-  version: 1.0.0
+  version: 1.1.0
   description: |
     Specification for the Go offline-first real-time chat backend.
-    Establishes persistent WebSocket connections over `/ws?user_id={id}` and exchanges JSON-encoded `Envelope` transport frames.
+    Supports secure short-lived single-use WebSocket tickets, real-time message sequencing with presence acknowledgments, and conversation management REST endpoints.
 servers:
   - url: http://localhost:8080
     description: Local Development HTTP Server
@@ -12,107 +12,195 @@ servers:
     description: Local Development WebSocket Server
 
 paths:
+  /api/v1/ws/ticket:
+    post:
+      summary: Issue Short-Lived Single-Use WebSocket Ticket
+      description: Exchanges an active Bearer access token for a 30-second single-use ticket to securely authenticate WebSocket handshakes without passing access tokens in URL parameters.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Ticket generated successfully.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ticket:
+                    type: string
+                    format: uuid
+                  expires_in:
+                    type: integer
+                    example: 30
+        '401':
+          description: Invalid or revoked JWT access token.
+
   /ws:
     get:
       summary: Establish WebSocket Connection
       description: |
         Upgrades an incoming HTTP GET request to a persistent WebSocket protocol session.
-        Requires a valid `user_id` query parameter to authenticate and bind the connection socket to the central Hub.
+        Accepts `ticket={uuid}` (recommended, short-lived single-use ticket) or `Authorization: Bearer <token>` header.
       parameters:
-        - name: user_id
+        - name: ticket
           in: query
-          required: true
-          description: Unique string identifier for the connecting user client.
+          required: false
+          description: Single-use 30-second ticket issued by `/api/v1/ws/ticket`.
           schema:
             type: string
-          example: "alice"
+          example: "7b4c6e7a-9a8f-4d92-bf3c-446655440000"
+        - name: user_id
+          in: query
+          required: false
+          description: Development-only fallback identifier.
+          schema:
+            type: string
       responses:
         '101':
           description: Protocol upgraded successfully to WebSocket.
-        '400':
-          description: Connection rejected due to missing or empty `user_id` query parameter.
+        '401':
+          description: Connection rejected due to missing, expired, or revoked credentials.
+
+  /api/v1/conversations:
+    get:
+      summary: List User Conversations
+      description: Retrieves all active conversations for the authenticated user, including unread count, last message preview, and last read sequence IDs.
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of conversations.
           content:
-            text/plain:
+            application/json:
               schema:
-                type: string
-              example: "Missing required 'user_id' query parameter"
+                type: array
+                items:
+                  $ref: '#/components/schemas/ConversationSummary'
+    post:
+      summary: Create or Ensure Direct Conversation
+      description: Finds or creates a 1:1 direct conversation between the authenticated user and the recipient.
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [recipient_id]
+              properties:
+                recipient_id:
+                  type: string
+      responses:
+        '201':
+          description: Conversation resolved or created.
+
+  /api/v1/conversations/{id}/messages:
+    get:
+      summary: Fetch Conversation Messages
+      description: Returns paginated messages for a conversation respecting the user's cleared chat watermark.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: since_seq_id
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 0
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Paginated messages.
+
+  /api/v1/conversations/{id}/clear:
+    post:
+      summary: Clear Chat History
+      description: Performs a per-user soft clear by updating the requesting user's `cleared_seq_id` to the conversation's current sequence ID.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Chat history cleared for user.
+
+  /api/v1/conversations/{id}:
+    delete:
+      summary: Leave / Delete Conversation
+      description: Removes the authenticated user from the conversation.
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Conversation removed.
 
 components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
   schemas:
-    Envelope:
+    ConversationSummary:
       type: object
-      required:
-        - type
-        - data
-      properties:
-        type:
-          type: string
-          enum: [chat, ack]
-          description: Payload type discriminator indicating how the inner `data` JSON is structured.
-          example: "chat"
-        data:
-          type: object
-          description: Raw JSON payload object corresponding to the specified envelope `type`.
-          oneOf:
-            - $ref: '#/components/schemas/Message'
-            - $ref: '#/components/schemas/DeliveryACK'
-      example:
-        type: "chat"
-        data:
-          id: "550e8400-e29b-41d4-a716-446655440000"
-          sender_id: "alice"
-          recipient_id: "bob"
-          content: "Hello Bob!"
-
-    Message:
-      type: object
-      required:
-        - id
-        - sender_id
-        - recipient_id
-        - content
       properties:
         id:
           type: string
-          format: uuid
-          description: Deterministic UUID generated client-side before transmission for deduplication and offline status tracking.
-          example: "550e8400-e29b-41d4-a716-446655440000"
-        sender_id:
+        type:
           type: string
-          description: User ID of the message author.
-          example: "alice"
+        title:
+          type: string
         recipient_id:
           type: string
-          description: User ID of the destination recipient.
-          example: "bob"
+        unread_count:
+          type: integer
+        last_seq_id:
+          type: integer
+        last_read_seq_id:
+          type: integer
+        updated_at:
+          type: string
+          format: date-time
+        last_message:
+          $ref: '#/components/schemas/Message'
+    Message:
+      type: object
+      properties:
+        id:
+          type: integer
+        conversation_id:
+          type: string
+        seq_id:
+          type: integer
+        sender_id:
+          type: string
+        client_msg_id:
+          type: string
+        content_type:
+          type: string
         content:
           type: string
-          description: Text payload of the message.
-          example: "Hello Bob!"
-
-    DeliveryACK:
-      type: object
-      required:
-        - message_id
-        - sender_id
-        - recipient_id
-        - status
-      properties:
-        message_id:
+        created_at:
           type: string
-          format: uuid
-          description: UUID matching the original `Message.id` being acknowledged.
-          example: "550e8400-e29b-41d4-a716-446655440000"
-        sender_id:
-          type: string
-          description: User ID of the original message sender.
-          example: "alice"
-        recipient_id:
-          type: string
-          description: User ID acknowledging receipt of the message.
-          example: "bob"
-        status:
-          type: string
-          enum: [DELIVERED, READ]
-          description: Delivery confirmation status.
-          example: "DELIVERED"
+          format: date-time
