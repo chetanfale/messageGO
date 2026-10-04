@@ -3,8 +3,10 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
@@ -97,7 +99,22 @@ func (d *DB) EnsureDirectConversation(ctx context.Context, userA, userB string) 
 	return convID, nil
 }
 
-// SaveMessageAtomic writes a message with an atomic monotonic sequence number
+// IsParticipant checks if a user is an active participant in a conversation
+func (d *DB) IsParticipant(ctx context.Context, convID, userID string) (bool, error) {
+	query := `SELECT 1 FROM conversation_participants WHERE conversation_id = $1 AND user_id = $2 LIMIT 1;`
+	var dummy int
+	err := d.pool.QueryRowContext(ctx, query, convID, userID).Scan(&dummy)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// SaveMessageAtomic writes a message with an atomic monotonic sequence number.
+// Supports idempotency: if a client_msg_id was already saved for the conversation, the existing message is returned.
 func (d *DB) SaveMessageAtomic(ctx context.Context, convID, senderID, clientMsgID, contentType, content string) (*models.Message, error) {
 	if contentType == "" {
 		contentType = "text"
@@ -128,6 +145,35 @@ func (d *DB) SaveMessageAtomic(ctx context.Context, convID, senderID, clientMsgI
 		&msg.CreatedAt,
 	)
 	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("conversation not found: %s: %w", convID, err)
+		}
+
+		// Handle duplicate client_msg_id for idempotency (SQLSTATE 23505 / uq_conversation_client_msg)
+		errStr := err.Error()
+		if strings.Contains(errStr, "uq_conversation_client_msg") || strings.Contains(errStr, "23505") || strings.Contains(errStr, "duplicate key") {
+			var existing models.Message
+			fetchQuery := `
+				SELECT id, conversation_id, seq_id, sender_id, client_msg_id, content_type, content, created_at
+				FROM messages
+				WHERE conversation_id = $1 AND client_msg_id = $2
+				LIMIT 1;
+			`
+			fetchErr := d.pool.QueryRowContext(ctx, fetchQuery, convID, clientMsgID).Scan(
+				&existing.ID,
+				&existing.ConversationID,
+				&existing.SeqID,
+				&existing.SenderID,
+				&existing.ClientMsgID,
+				&existing.ContentType,
+				&existing.Content,
+				&existing.CreatedAt,
+			)
+			if fetchErr == nil {
+				return &existing, nil
+			}
+		}
+
 		return nil, fmt.Errorf("failed atomic message insert: %w", err)
 	}
 

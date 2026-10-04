@@ -181,8 +181,41 @@ func (h *Hub) handleChatMessage(ctx context.Context, sender *Client, data json.R
 		return
 	}
 
-	// Validation 2: If conversation ID is missing, resolve or create 1:1 conversation
-	if convID == "" {
+	// Validation 2: If conversation ID is provided, validate UUID & participant status; otherwise resolve/create 1:1 conversation
+	if convID != "" {
+		if _, err := uuid.Parse(convID); err != nil {
+			if recipientID != "" {
+				var errDirect error
+				convID, errDirect = h.db.EnsureDirectConversation(ctx, sender.UserID, recipientID)
+				if errDirect != nil {
+					log.Printf("[HUB] Failed to resolve fallback conversation between %s and %s: %v", sender.UserID, recipientID, errDirect)
+					sender.sendError("INVALID_CONVERSATION_ID", "Invalid conversation ID format: must be a valid UUID")
+					return
+				}
+			} else {
+				sender.sendError("INVALID_CONVERSATION_ID", "Invalid conversation ID format: must be a valid UUID")
+				return
+			}
+		} else {
+			// Check if sender is a participant of this conversation
+			isPart, err := h.db.IsParticipant(ctx, convID, sender.UserID)
+			if err != nil || !isPart {
+				if recipientID != "" {
+					// Auto-fallback: ensure direct conversation between sender and recipient
+					var errDirect error
+					convID, errDirect = h.db.EnsureDirectConversation(ctx, sender.UserID, recipientID)
+					if errDirect != nil {
+						log.Printf("[HUB] Failed to resolve direct conversation between %s and %s: %v", sender.UserID, recipientID, errDirect)
+						sender.sendError("DB_ERROR", "Failed to resolve conversation")
+						return
+					}
+				} else {
+					sender.sendError("CONVERSATION_NOT_FOUND", "Conversation does not exist or you are not an active participant")
+					return
+				}
+			}
+		}
+	} else {
 		if recipientID == "" {
 			sender.sendError("MISSING_TARGET", "Either conversation_id or valid recipient_id (handle/email/id) is required")
 			return
@@ -221,8 +254,12 @@ func (h *Hub) handleChatMessage(ctx context.Context, sender *Client, data json.R
 	// 1. Atomic sequence assignment and database insertion
 	msg, err := h.db.SaveMessageAtomic(ctx, convID, sender.UserID, clientMsgID, contentType, cleanContent)
 	if err != nil {
-		log.Printf("[HUB] Failed to save message atomically: %v", err)
-		sender.sendError("PERSIST_ERROR", "Failed to persist message")
+		log.Printf("[HUB] Failed to save message [conv=%s, sender=%s]: %v", convID, sender.UserID, err)
+		if strings.Contains(err.Error(), "not found") {
+			sender.sendError("CONVERSATION_NOT_FOUND", "Conversation does not exist")
+		} else {
+			sender.sendError("PERSIST_ERROR", "Failed to persist message: "+err.Error())
+		}
 		return
 	}
 
@@ -279,6 +316,11 @@ func (h *Hub) handleDeliveryACK(ctx context.Context, client *Client, data json.R
 		return
 	}
 
+	ack.ConversationID = strings.TrimSpace(ack.ConversationID)
+	if _, err := uuid.Parse(ack.ConversationID); err != nil {
+		return
+	}
+
 	ack.RecipientID = client.UserID
 	ack.Timestamp = time.Now()
 
@@ -294,6 +336,11 @@ func (h *Hub) handleDeliveryACK(ctx context.Context, client *Client, data json.R
 func (h *Hub) handleReadACK(ctx context.Context, client *Client, data json.RawMessage) {
 	var ack models.ReadACK
 	if err := json.Unmarshal(data, &ack); err != nil {
+		return
+	}
+
+	ack.ConversationID = strings.TrimSpace(ack.ConversationID)
+	if _, err := uuid.Parse(ack.ConversationID); err != nil {
 		return
 	}
 
@@ -317,6 +364,12 @@ func (h *Hub) handleSyncRequest(ctx context.Context, client *Client, data json.R
 	}
 
 	convID := strings.TrimSpace(req.ConversationID)
+	if convID != "" {
+		if _, err := uuid.Parse(convID); err != nil {
+			convID = ""
+		}
+	}
+
 	if convID == "" && req.RecipientID != "" {
 		targetID := h.resolveUserID(req.RecipientID)
 		if targetID != "" {
@@ -329,7 +382,7 @@ func (h *Hub) handleSyncRequest(ctx context.Context, client *Client, data json.R
 	}
 
 	if convID == "" {
-		client.sendError("BAD_SYNC_REQUEST", "conversation_id or recipient_id is required")
+		client.sendError("BAD_SYNC_REQUEST", "Valid conversation_id (UUID) or recipient_id is required")
 		return
 	}
 

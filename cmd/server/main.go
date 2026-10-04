@@ -138,9 +138,12 @@ func enableCORS(w http.ResponseWriter) {
 func authenticate(r *http.Request, cfg *config.Config, rdb *redis.Client) (*auth.JWTCustomClaims, error) {
 	authHeader := r.Header.Get("Authorization")
 	if !strings.HasPrefix(authHeader, "Bearer ") {
-		return nil, errors.New("missing or malformed Authorization header")
+		return nil, errors.New("missing or malformed Authorization header; active Bearer access token required")
 	}
-	tokenStr := strings.TrimPrefix(authHeader, "Bearer ")
+	tokenStr := strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
+	if tokenStr == "" {
+		return nil, errors.New("empty bearer token")
+	}
 	return auth.ValidateAccessTokenWithRevocation(r.Context(), tokenStr, cfg.JWTAccessSecret, rdb)
 }
 
@@ -243,6 +246,10 @@ func handleConversationItem(w http.ResponseWriter, r *http.Request, cfg *config.
 	}
 
 	convID := parts[0]
+	if _, err := uuid.Parse(convID); err != nil {
+		http.Error(w, "Invalid conversation ID: must be a valid UUID", http.StatusBadRequest)
+		return
+	}
 
 	// 1. DELETE /api/v1/conversations/{id}
 	if len(parts) == 1 && r.Method == http.MethodDelete {
@@ -310,29 +317,32 @@ func serveWS(cfg *config.Config, hub *chat.Hub, rdb *redis.Client, w http.Respon
 	var userID, email, username string
 
 	// 1. Primary auth: Single-use short-lived ticket
-	ticket := r.URL.Query().Get("ticket")
+	ticket := strings.TrimSpace(r.URL.Query().Get("ticket"))
 	if ticket != "" {
 		data, err := rdb.ConsumeWSTicket(r.Context(), ticket)
 		if err != nil || len(data) == 0 {
-			log.Printf("[SERVER] Handshake rejected: invalid or expired ticket")
+			log.Printf("[SERVER] Handshake rejected: invalid or expired ticket: %s", ticket)
 			http.Error(w, "Unauthorized: Invalid or expired ticket", http.StatusUnauthorized)
 			return
 		}
 		var parsed map[string]string
-		if err := json.Unmarshal(data, &parsed); err == nil {
-			userID = parsed["user_id"]
-			email = parsed["email"]
-			username = parsed["username"]
+		if err := json.Unmarshal(data, &parsed); err != nil || parsed["user_id"] == "" {
+			log.Printf("[SERVER] Handshake rejected: malformed ticket payload")
+			http.Error(w, "Unauthorized: Invalid ticket payload", http.StatusUnauthorized)
+			return
 		}
+		userID = parsed["user_id"]
+		email = parsed["email"]
+		username = parsed["username"]
 	}
 
-	// 2. Secondary auth: Authorization header / query token with Redis revocation validation
+	// 2. Secondary auth: Active Bearer access token in Authorization header or query token parameter
 	if userID == "" {
-		tokenStr := r.URL.Query().Get("token")
+		tokenStr := strings.TrimSpace(r.URL.Query().Get("token"))
 		if tokenStr == "" {
 			authHeader := r.Header.Get("Authorization")
 			if strings.HasPrefix(authHeader, "Bearer ") {
-				tokenStr = strings.TrimPrefix(authHeader, "Bearer ")
+				tokenStr = strings.TrimSpace(strings.TrimPrefix(authHeader, "Bearer "))
 			}
 		}
 
@@ -350,15 +360,9 @@ func serveWS(cfg *config.Config, hub *chat.Hub, rdb *redis.Client, w http.Respon
 			} else {
 				username = email
 			}
-		} else if cfg.Env == "development" && r.URL.Query().Get("user_id") != "" {
-			// Dev fallback for quick manual testing without JWT
-			userID = r.URL.Query().Get("user_id")
-			email = userID
-			username = userID
-			log.Printf("[SERVER] Handshake in dev mode for user_id=%s without token", userID)
 		} else {
 			log.Println("[SERVER] Handshake rejected: missing authentication credentials")
-			http.Error(w, "Unauthorized: Missing authentication ticket or token", http.StatusUnauthorized)
+			http.Error(w, "Unauthorized: Valid single-use ticket or active access token required", http.StatusUnauthorized)
 			return
 		}
 	}

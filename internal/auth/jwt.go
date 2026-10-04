@@ -41,8 +41,8 @@ func ValidateAccessToken(tokenString, secret string) (*JWTCustomClaims, error) {
 	}
 
 	claims, ok := token.Claims.(*JWTCustomClaims)
-	if !ok || !token.Valid {
-		return nil, errors.New("invalid token claims")
+	if !ok || !token.Valid || claims.UserID == "" {
+		return nil, errors.New("invalid token claims: missing user identification")
 	}
 
 	return claims, nil
